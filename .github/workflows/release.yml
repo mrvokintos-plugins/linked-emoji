@@ -1,0 +1,87 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'LICENSE']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: build
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base=$(cat VERSION)
+          last=$(gh release list -L 100 --exclude-drafts --json tagName --jq '.[].tagName' \
+            | sed -n "s/^v${base//./\\.}\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)
+          version="$base.$(( ${last:-0} + 1 ))"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          PLUGIN_VERSION="$version" pnpm exec inu check
+          PLUGIN_VERSION="$version" pnpm exec inu build
+
+      - name: release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # skip when the plugin is identical to the latest release (ignoring the version line)
+          mkdir -p prev
+          if gh release download -p '*.inu.js' -D prev --clobber 2>/dev/null; then
+            if diff -q <(grep -v '^// @version' prev/linked-emoji.inu.js) <(grep -v '^// @version' dist/linked-emoji.inu.js) >/dev/null; then
+              echo "plugin unchanged since the latest release, not releasing"
+              exit 0
+            fi
+          fi
+          tag="v${{ steps.build.outputs.version }}"
+          git log -1 --format='%s%n%n%b' > notes.md
+          for attempt in 1 2 3; do
+            if gh release create "$tag" dist/linked-emoji.inu.js --title "$tag" --notes-file notes.md; then break; fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep $((attempt * 15))
+            gh release delete "$tag" --cleanup-tag -y 2>/dev/null || git push origin ":refs/tags/$tag" 2>/dev/null || true
+          done
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: publish to Telegram
+        if: steps.release.outputs.released == 'true' && vars.TELEGRAM_REPO_CHANNEL != ''
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          REPO_CHANNEL: ${{ vars.TELEGRAM_REPO_CHANNEL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BOT_TOKEN" ]; then echo "TELEGRAM_BOT_TOKEN is not set, skipping"; exit 0; fi
+          python3 scripts/tg-caption.py "${{ steps.build.outputs.version }}" "$GITHUB_SHA" "${{ steps.release.outputs.tag }}" > caption.html
+          curl -sS --fail-with-body \
+            --form-string chat_id="@${REPO_CHANNEL#@}" \
+            --form-string parse_mode=HTML \
+            -F document=@dist/linked-emoji.inu.js \
+            -F caption="<caption.html" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" > /dev/null
+          echo "posted to @${REPO_CHANNEL#@}"
