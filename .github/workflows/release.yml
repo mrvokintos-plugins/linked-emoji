@@ -2,6 +2,11 @@ name: release
 
 on:
   workflow_dispatch:
+    inputs:
+      create_post:
+        description: Post the latest release to the main channel once (its id then goes to TELEGRAM_POST_ID)
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths-ignore: ['**.md', 'LICENSE']
@@ -14,7 +19,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  create-post:
+    if: github.event_name == 'workflow_dispatch' && inputs.create_post
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: post the latest release to the main channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHANNEL: ${{ vars.TELEGRAM_CHANNEL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CHANNEL" ]; then echo "::error::TELEGRAM_CHANNEL is not set"; exit 1; fi
+          tag=$(gh release view --json tagName --jq .tagName)
+          gh release download "$tag" -p '*.inu.js' -D dist --clobber
+          python3 scripts/tg-caption.py "${tag#v}" "$(git rev-list -n1 "$tag" 2>/dev/null || echo "$GITHUB_SHA")" "$tag" > caption.html
+          id=$(curl -sS --fail-with-body \
+            --form-string chat_id="@${CHANNEL#@}" \
+            --form-string parse_mode=HTML \
+            -F document=@dist/linked-emoji.inu.js \
+            -F caption="<caption.html" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["message_id"])')
+          echo "::notice::created post $id; set TELEGRAM_POST_ID=$id"
+          echo "POST_ID=$id"
+
   release:
+    if: github.event_name == 'push' || !inputs.create_post
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -85,3 +116,22 @@ jobs:
             -F caption="<caption.html" \
             "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" > /dev/null
           echo "posted to @${REPO_CHANNEL#@}"
+
+      - name: update the main channel post
+        if: steps.release.outputs.released == 'true' && vars.TELEGRAM_CHANNEL != '' && vars.TELEGRAM_POST_ID != ''
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHANNEL: ${{ vars.TELEGRAM_CHANNEL }}
+          POST_ID: ${{ vars.TELEGRAM_POST_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BOT_TOKEN" ]; then echo "TELEGRAM_BOT_TOKEN is not set, skipping"; exit 0; fi
+          python3 scripts/tg-caption.py "${{ steps.build.outputs.version }}" "$GITHUB_SHA" "${{ steps.release.outputs.tag }}" > caption.html
+          media=$(python3 -c 'import json; print(json.dumps({"type": "document", "media": "attach://plugin", "caption": open("caption.html").read(), "parse_mode": "HTML"}))')
+          curl -sS --fail-with-body \
+            --form-string chat_id="@${CHANNEL#@}" \
+            --form-string message_id="$POST_ID" \
+            --form-string media="$media" \
+            -F plugin=@dist/linked-emoji.inu.js \
+            "https://api.telegram.org/bot${BOT_TOKEN}/editMessageMedia" > /dev/null
+          echo "updated @${CHANNEL#@}/$POST_ID"
